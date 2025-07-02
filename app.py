@@ -2,9 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import streamlit as st
-import gspread
-import json
-from google.oauth2.service_account import Credentials
+from io import BytesIO
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -13,31 +11,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Google Sheets API Authentication ---
-# This function connects to Google Sheets using Render's Environment Variables.
-def authenticate_gspread():
-    """Authenticates with Google Sheets API using secrets from Render's Environment Variables."""
-    try:
-        # Fetch the entire JSON credentials string from the environment variable
-        creds_json_str = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-        
-        if not creds_json_str:
-            st.error("GCP_SERVICE_ACCOUNT_JSON environment variable not found on the server.")
-            st.info("Please ensure the secret is configured correctly in the Render dashboard.")
-            return None
-        
-        # Convert the JSON string back into a dictionary
-        creds_dict = json.loads(creds_json_str)
-        
-        scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(creds)
-    except Exception as e:
-        st.error(f"Failed to authenticate with Google Sheets: {e}")
-        return None
-
 # --- Core KPI Calculation Function (Unchanged) ---
-# This is the same powerful function from our previous discussions.
+# This powerful function is the engine of the report and does not need to be changed.
 def calculate_kpis(sub_df):
     """Calculates a comprehensive list of KPIs for a given subset of leads."""
     if sub_df.empty:
@@ -69,87 +44,97 @@ def calculate_kpis(sub_df):
     kpis['% Contri. of Leads Contacted after 24 hours'] = (connected_after_24h / len(total_connected_df) * 100) if not total_connected_df.empty else 0
     return kpis
 
+# --- Function to convert DataFrame to Excel in memory ---
+def to_excel(df):
+    """Converts a DataFrame to an Excel file in memory (bytes)."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='KPI_Report')
+    processed_data = output.getvalue()
+    return processed_data
+
 # --- Main Application UI and Logic ---
 st.title("📊 KPI Report Generator")
-st.markdown("Upload your lead master Excel file, and this tool will generate a consolidated KPI report and upload it to the designated Google Sheet.")
+st.markdown("Upload your lead master Excel file to generate a downloadable, consolidated KPI report.")
 
-uploaded_file = st.file_uploader("Choose your Excel file", type=['xlsx'], help="Please upload the 'CX Callling KPIs Lead Master' file.")
-TARGET_URL = "https://docs.google.com/spreadsheets/d/1BHqpUbEMlXasWrk6gRZOgEyGZiEnh7WK7z7YHgiR80k/edit"
-st.text_input("Target Google Sheet (Output)", TARGET_URL, disabled=True)
+# --- File Uploader ---
+uploaded_file = st.file_uploader(
+    "Choose your Excel file",
+    type=['xlsx'],
+    help="Please upload the 'CX Callling KPIs Lead Master' file."
+)
 
-if st.button("Generate and Upload Report", type="primary"):
-    if uploaded_file is not None:
-        with st.spinner("Processing your file... This may take a moment."):
-            try:
-                # 1. Data Preparation
-                st.write("Step 1: Reading and preparing data...")
-                df = pd.read_excel(uploaded_file)
-                df = df.rename(columns={
-                    'is Lead Called?': 'is_Lead_Called',
-                    'is Lead Connected?': 'is_Lead_Connected',
-                    'TimeDiffLeadAttempt': 'TimeDiffLeadAttempt_hours',
-                    'TimeDiffLeadConnect': 'TimeDiffLeadConnect_hours'
-                })
-                df['LeadCreateDateTime_dt'] = pd.to_datetime(df['LeadCreateDateTime'], errors='coerce')
-                df['LeadCreateMonth'] = df['LeadCreateMonth'].astype(str)
-                df.dropna(subset=['LeadCreateDateTime_dt', 'LeadCreateMonth', 'Opportunity Source'], inplace=True)
-                st.success("Data prepared successfully.")
+if uploaded_file is not None:
+    with st.spinner("Processing your file..."):
+        try:
+            # 1. Data Preparation
+            df = pd.read_excel(uploaded_file)
+            df = df.rename(columns={
+                'is Lead Called?': 'is_Lead_Called',
+                'is Lead Connected?': 'is_Lead_Connected',
+                'TimeDiffLeadAttempt': 'TimeDiffLeadAttempt_hours',
+                'TimeDiffLeadConnect': 'TimeDiffLeadConnect_hours'
+            })
+            df['LeadCreateDateTime_dt'] = pd.to_datetime(df['LeadCreateDateTime'], errors='coerce')
+            df['LeadCreateMonth'] = df['LeadCreateMonth'].astype(str)
+            df.dropna(subset=['LeadCreateDateTime_dt', 'LeadCreateMonth', 'Opportunity Source'], inplace=True)
+            
+            # 2. Main Loop and Report Consolidation
+            kpi_group_mapping = {
+                '# of Leads Created (Salesforce)': 'Lead Vol', '# of Qualified leads': 'Lead Vol', '% Qualified Leads of Leads Created': 'Lead Vol',
+                '# of Leads Attempted': 'Lead Attempt', 'Attempt% of Qualified leads': 'Lead Attempt',
+                'Time to First Attempt (P50) in hours': 'Lead Attempt', 'Time to First Attempt (P90) in hours': 'Lead Attempt',
+                '% Contri. of Leads Attempted after 24 hours': 'Lead Attempt',
+                '# of Leads Connected': 'Lead Connect', 'Connection % of Qualified Leads': 'Lead Connect',
+                'Time to First Connect (P50) in hours': 'Lead Connect', 'Time to First Connect (P90) in hours': 'Lead Connect',
+                '% Contri. of Leads Contacted after 24 hours': 'Lead Connect'
+            }
+            periods_to_analyze = {'April': '2025-04', 'May': '2025-05', 'June MTD (till 19th)': '2025-06'}
+            sources_to_analyze = ['Overall'] + sorted([s for s in df['Opportunity Source'].unique() if pd.notna(s)])
+            all_reports_list = []
+
+            for source in sources_to_analyze:
+                monthly_kpis_for_source = {}
+                df_source = df[df['Opportunity Source'] == source].copy() if source != 'Overall' else df.copy()
+                for period_name, month_string in periods_to_analyze.items():
+                    if 'MTD' in period_name:
+                        day_limit = int(period_name.split('till ')[1].replace('th','').replace('st','').replace('nd','').replace('rd','').replace(')',''))
+                        df_period = df_source[(df_source['LeadCreateDateTime_dt'].dt.strftime('%Y-%m') == month_string) & (df_source['LeadCreateDateTime_dt'].dt.day <= day_limit)].copy()
+                    else:
+                        df_period = df_source[df_source['LeadCreateDateTime_dt'].dt.strftime('%Y-%m') == month_string].copy()
+                    monthly_kpis_for_source[period_name] = calculate_kpis(df_period)
+                filtered_results = {k: v for k, v in monthly_kpis_for_source.items() if v}
+                if not filtered_results: continue
                 
-                # 2. Main Loop and Report Consolidation
-                st.write("Step 2: Generating KPI reports for each segment...")
-                kpi_group_mapping = {
-                    '# of Leads Created (Salesforce)': 'Lead Vol', '# of Qualified leads': 'Lead Vol', '% Qualified Leads of Leads Created': 'Lead Vol',
-                    '# of Leads Attempted': 'Lead Attempt', 'Attempt% of Qualified leads': 'Lead Attempt',
-                    'Time to First Attempt (P50) in hours': 'Lead Attempt', 'Time to First Attempt (P90) in hours': 'Lead Attempt',
-                    '% Contri. of Leads Attempted after 24 hours': 'Lead Attempt',
-                    '# of Leads Connected': 'Lead Connect', 'Connection % of Qualified Leads': 'Lead Connect',
-                    'Time to First Connect (P50) in hours': 'Lead Connect', 'Time to First Connect (P90) in hours': 'Lead Connect',
-                    '% Contri. of Leads Contacted after 24 hours': 'Lead Connect'
-                }
-                periods_to_analyze = {'April': '2025-04', 'May': '2025-05', 'June MTD (till 19th)': '2025-06'}
-                sources_to_analyze = ['Overall'] + sorted([s for s in df['Opportunity Source'].unique() if pd.notna(s)])
-                all_reports_list = []
-                for source in sources_to_analyze:
-                    monthly_kpis_for_source = {}
-                    df_source = df[df['Opportunity Source'] == source].copy() if source != 'Overall' else df.copy()
-                    for period_name, month_string in periods_to_analyze.items():
-                        if 'MTD' in period_name:
-                            day_limit = int(period_name.split('till ')[1].replace('th','').replace('st','').replace('nd','').replace('rd','').replace(')',''))
-                            df_period = df_source[(df_source['LeadCreateDateTime_dt'].dt.strftime('%Y-%m') == month_string) & (df_source['LeadCreateDateTime_dt'].dt.day <= day_limit)].copy()
-                        else:
-                            df_period = df_source[df_source['LeadCreateDateTime_dt'].dt.strftime('%Y-%m') == month_string].copy()
-                        monthly_kpis_for_source[period_name] = calculate_kpis(df_period)
-                    filtered_results = {k: v for k, v in monthly_kpis_for_source.items() if v}
-                    if not filtered_results: continue
-                    kpi_df = pd.DataFrame(filtered_results).reset_index().rename(columns={'index': 'KPIs'})
-                    kpi_df.insert(0, 'Source', source)
-                    kpi_df.insert(1, 'Overall Leads', kpi_df['KPIs'].map(kpi_group_mapping))
-                    all_reports_list.append(kpi_df)
-                    blank_df = pd.DataFrame([[''] * len(kpi_df.columns)], columns=kpi_df.columns)
-                    all_reports_list.append(blank_df)
-                    all_reports_list.append(blank_df.copy())
-                if all_reports_list:
-                    all_reports_list = all_reports_list[:-2]
-                st.success("All segments processed.")
+                kpi_df = pd.DataFrame(filtered_results).reset_index().rename(columns={'index': 'KPIs'})
+                kpi_df.insert(0, 'Source', source)
+                kpi_df.insert(1, 'Overall Leads', kpi_df['KPIs'].map(kpi_group_mapping))
+                all_reports_list.append(kpi_df)
+                
+                # Add 2 blank rows after each segment's data
+                blank_df = pd.DataFrame([[''] * len(kpi_df.columns)], columns=kpi_df.columns)
+                all_reports_list.append(blank_df)
+                all_reports_list.append(blank_df.copy())
+            
+            # 3. Prepare the final DataFrame and provide a download button
+            if all_reports_list:
+                # Remove the last two blank rows
+                final_report_df = pd.concat(all_reports_list[:-2], ignore_index=True).round(1)
+                
+                st.success("🎉 Your report has been generated!")
+                st.dataframe(final_report_df) # Show a preview of the report
+                
+                # Convert the final DataFrame to an Excel file in memory
+                excel_data = to_excel(final_report_df)
+                
+                st.download_button(
+                    label="📥 Download Report as Excel",
+                    data=excel_data,
+                    file_name="Consolidated_KPI_Report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.warning("No data found for any source in the specified periods. No report was generated.")
 
-                # 3. Upload to Google Sheets
-                st.write("Step 3: Uploading consolidated report to Google Sheets...")
-                if all_reports_list:
-                    final_report_df = pd.concat(all_reports_list, ignore_index=True).round(1)
-                    gc = authenticate_gspread()
-                    if gc:
-                        spreadsheet = gc.open_by_url(TARGET_URL)
-                        worksheet = spreadsheet.sheet1
-                        worksheet.clear()
-                        data_to_upload = [final_report_df.columns.values.tolist()] + final_report_df.astype(str).values.tolist()
-                        worksheet.update('A1', data_to_upload, value_input_option='USER_ENTERED')
-                        st.balloons()
-                        st.success("🎉 Report successfully generated and uploaded to Google Sheets!")
-                        st.markdown(f"**[Click here to view the report]({TARGET_URL})**")
-                        st.dataframe(final_report_df)
-                else:
-                    st.warning("No data found for any source in the specified periods. No report was generated.")
-            except Exception as e:
-                st.error(f"An error occurred during processing: {e}")
-    else:
-        st.warning("Please upload an Excel file to proceed.")
+        except Exception as e:
+            st.error(f"An error occurred during processing: {e}")
